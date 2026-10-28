@@ -27,8 +27,10 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const MONOREPO_ROOT = path.resolve(import.meta.dir, '..');
+const __filename = fileURLToPath(import.meta.url);
+const MONOREPO_ROOT = path.resolve(path.dirname(__filename), '..');
 
 // Everything that can change a helper binary or its npm package. Bump the `v1`
 // in the key prefix to invalidate preview caches when something outside these
@@ -119,7 +121,8 @@ export function nativeBuildTouched(side: NativeSide) {
   return differs(mergeBase, buildInputs(side));
 }
 
-if (import.meta.main) {
+// run as a script (not when imported by check-release-packages.ts)
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
   const lines: Array<string> = [];
   for (const side of Object.keys(NATIVE_SOURCES) as Array<NativeSide>) {
     const changed = nativeSourcesChanged(side);
