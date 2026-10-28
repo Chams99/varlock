@@ -38,10 +38,8 @@ jobs:
           echo "::error::Timed out waiting for CI test suite"
           exit 1
 
-  # Determine what bumpy will do, and probe the native-binary caches: if this
-  # exact source (+ build scripts + workflows) already produced a
-  # signed/notarized binary on a previous run, we reuse it instead of
-  # rebuilding and (for macOS) re-notarizing.
+  # Determine what bumpy will do. Native binaries are only built when publishing
+  # varlock, and always from source in that same run (see build-native-macos).
   plan:
     needs: wait-for-tests
     runs-on: ubuntu-latest
@@ -50,10 +48,6 @@ jobs:
       bumpy-version: ${{ steps.bumpy-version.outputs.version }}
       includes-varlock: ${{ contains(fromJSON(steps.plan.outputs.json).packageNames, 'varlock') }}
       includes-vscode: ${{ contains(fromJSON(steps.plan.outputs.json).packageNames, 'env-spec-language') }}
-      macos-cache-key: ${{ steps.keys.outputs.macos-cache-key }}
-      rust-source-hash: ${{ steps.keys.outputs.rust-source-hash }}
-      macos-cache-hit: ${{ steps.macos-cache.outputs.cache-hit }}
-      rust-cache-hit: ${{ steps.rust-cache.outputs.cache-hit }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Bun
@@ -70,60 +64,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      # Content-addressed native binary cache keys, shared with test.yaml (PR
-      # previews restore what this workflow saves). See the action for details.
-      - id: keys
-        uses: ./.github/actions/native-bin-cache-keys
-
-      # Probe caches (lookup-only, no download). cache-hit is 'true' only on an
-      # exact key match within this branch's scope (main + its base); feature
-      # branch caches are not visible here. Other jobs on main can still write
-      # these keys, so a release only reuses the macOS bundle, and only after
-      # verify-native-macos checks its team-pinned signature; Rust is always
-      # rebuilt for a publish.
-      #
-      # Probed on every push to main, not just publishes: a miss (native source
-      # changed, or the cache was evicted after 7 idle days) builds, signs,
-      # notarizes, and saves the binaries right away, so PR previews can restore
-      # them instead of each rebuilding (see test.yaml native-cache-check).
-      - name: Probe macOS notarized binary cache
-        id: macos-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: packages/varlock/native-bins/darwin/VarlockEnclave.app
-          key: ${{ steps.keys.outputs.macos-cache-key }}
-          lookup-only: true
-      - name: Probe Rust cache - linux-x64
-        id: rust-cache-linux-x64
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: packages/varlock/native-bins/linux-x64/
-          key: native-bin-rust-linux-x64-${{ steps.keys.outputs.rust-source-hash }}
-          lookup-only: true
-      - name: Probe Rust cache - linux-arm64
-        id: rust-cache-linux-arm64
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: packages/varlock/native-bins/linux-arm64/
-          key: native-bin-rust-linux-arm64-${{ steps.keys.outputs.rust-source-hash }}
-          lookup-only: true
-      - name: Probe Rust cache - win32-x64
-        id: rust-cache-win32-x64
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: packages/varlock/native-bins/win32-x64/
-          key: native-bin-rust-win32-x64-${{ steps.keys.outputs.rust-source-hash }}
-          lookup-only: true
-      - name: Aggregate Rust cache status
-        id: rust-cache
-        run: |
-          if [[ "${{ steps.rust-cache-linux-x64.outputs.cache-hit }}" == "true" \
-             && "${{ steps.rust-cache-linux-arm64.outputs.cache-hit }}" == "true" \
-             && "${{ steps.rust-cache-win32-x64.outputs.cache-hit }}" == "true" ]]; then
-            echo "cache-hit=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "cache-hit=false" >> "$GITHUB_OUTPUT"
-          fi
 
   # Open/update the "version packages" PR. This is the non-publish path: when
   # bump files are pending on main, bumpy computes versions + changelogs and
@@ -151,107 +91,55 @@ jobs:
           BUMPY_GH_TOKEN: ${{ secrets.BUMPY_GH_TOKEN }}
           GH_TOKEN: ${{ github.token }}
 
-  # Build + sign the macOS native binary. Skipped on a cache hit: the previously
-  # notarized bundle is reused and re-verified (see verify-native-macos) instead.
-  #
-  # On a miss this also runs on non-publish pushes, purely to save the main-scoped
-  # cache that PR previews restore. It is skipped for a publish that does not
-  # include varlock, so a native build failure cannot block an unrelated release.
+  # Native binaries for a varlock publish are always built, signed, and (macOS)
+  # notarized from source in this run. Nothing a release ships comes from the
+  # Actions cache: the keys are predictable and any job in main's cache scope
+  # (schedule, workflow_run, a compromised dependency in a push run) can write
+  # them, so neither binary caches nor build caches (Cargo, Swift .build) are used.
   build-native-macos:
     needs: plan
-    if: needs.plan.outputs.macos-cache-hit != 'true' && (needs.plan.outputs.mode != 'publish' || needs.plan.outputs.includes-varlock == 'true')
+    if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
     uses: ./.github/workflows/build-native-macos.yaml
     with:
       mode: release
       artifact-name: native-bin-macos-signed
+      sign: true
+      use-build-cache: false
     secrets:
       OP_CI_TOKEN: ${{ secrets.OP_CI_TOKEN }}
 
-  # Notarize for production npm distribution and cache the notarized bundle so
-  # future releases (and PR previews) with unchanged source can reuse it.
+  # Notarize for production npm distribution
   notarize-native-macos:
     needs: [plan, build-native-macos]
-    if: needs.plan.outputs.macos-cache-hit != 'true' && (needs.plan.outputs.mode != 'publish' || needs.plan.outputs.includes-varlock == 'true')
+    if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
     uses: ./.github/workflows/notarize-native-macos.yaml
     with:
       source-artifact-name: native-bin-macos-signed
       artifact-name: native-bin-macos-npm
-      cache-key: ${{ needs.plan.outputs.macos-cache-key }}
     secrets:
       OP_CI_TOKEN: ${{ secrets.OP_CI_TOKEN }}
 
-  # When the notarized bundle is reused from cache (build + notarize skipped),
-  # re-verify it on a macOS runner before we trust it in the publish step. This
-  # is the safety net for "never publish the wrong thing": a corrupted or
-  # un-notarized cached bundle fails here and blocks the release.
-  verify-native-macos:
-    needs: plan
-    if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true' && needs.plan.outputs.macos-cache-hit == 'true'
-    runs-on: macos-latest
-    steps:
-      - name: Restore notarized macOS binary from cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: packages/varlock/native-bins/darwin/VarlockEnclave.app
-          key: ${{ needs.plan.outputs.macos-cache-key }}
-          fail-on-cache-miss: true
-      # The cache key is predictable and any job in main's cache scope can save an
-      # entry under it, so a valid signature alone proves nothing: pin the
-      # Developer ID team (public, see docs/getting-started/installation), so a
-      # bundle signed and notarized under some other Apple account is rejected.
-      - name: Verify signature, notarization, and function
-        env:
-          APPLE_TEAM_ID: BPHZUT9PGB
-        run: |
-          APP="packages/varlock/native-bins/darwin/VarlockEnclave.app"
-          BIN="$APP/Contents/MacOS/varlock-local-encrypt"
-          echo "=== codesign verify (pinned to team $APPLE_TEAM_ID) ==="
-          codesign --verify --deep --strict --verbose=2 \
-            -R="anchor apple generic and certificate leaf[subject.OU] = \"$APPLE_TEAM_ID\"" "$APP"
-          codesign -dvv "$APP" 2>&1 || true
-          codesign -dvv "$APP" 2>&1 | grep -q "^TeamIdentifier=$APPLE_TEAM_ID$" \
-            || { echo "::error::cached bundle is not signed by team $APPLE_TEAM_ID"; exit 1; }
-          echo "=== notarization staple ==="
-          xcrun stapler validate "$APP"
-          echo "=== gatekeeper assessment (non-fatal) ==="
-          spctl -a -t exec -vv "$APP" || true
-          echo "=== functional smoke ==="
-          chmod +x "$BIN"
-          "$BIN" status | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['ok'], 'status not ok'"
-          echo "Cached notarized binary verified"
-
-  # Build Rust native binaries for Linux and Windows. A varlock publish always
-  # builds them in this run and never publishes cached ones: any job in main's
-  # cache scope (schedule, workflow_run, a compromised dependency in a push run)
-  # can save an entry under these predictable keys first, and unlike the macOS
-  # bundle (whose Developer ID signature + notarization verify-native-macos
-  # re-checks), a swapped Rust binary could not be detected. The build is cheap.
-  #
-  # Non-publish pushes build only on a cache miss, to save the main-scoped cache
-  # that PR previews restore. Previews already ship unreviewed PR code, so they do
-  # not raise the bar a poisoned entry would have to clear.
+  # Build + sign Rust native binaries for Linux and Windows
   build-native-rust:
     needs: plan
     permissions:
       contents: read
       id-token: write # Azure OIDC signing in the reusable workflow
-    if: >-
-      (needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true')
-      || (needs.plan.outputs.mode != 'publish' && needs.plan.outputs.rust-cache-hit != 'true')
+    if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
     uses: ./.github/workflows/build-native-rust.yaml
     with:
       artifact-name: native-bin-rust
-      source-hash: ${{ needs.plan.outputs.rust-source-hash }}
       sign: true
+      use-build-cache: false
     secrets:
       OP_CI_TOKEN: ${{ secrets.OP_CI_TOKEN }}
 
-  # Publish path: native binaries are ready (built this run or restored from
-  # cache), so build the npm packages and publish. Gated on `mode == 'publish'`;
+  # Publish path: native binaries are ready (built this run, or skipped when the
+  # publish does not include varlock), so build the npm packages and publish. Gated on `mode == 'publish'`;
   # the version-PR path is handled by the `version-pr` job above.
   release:
     name: Release
-    needs: [plan, notarize-native-macos, verify-native-macos, build-native-rust]
+    needs: [plan, notarize-native-macos, build-native-rust]
     if: always() && !failure() && !cancelled() && needs.plan.outputs.mode == 'publish'
     runs-on: ubuntu-latest
     # Publishing runs in the `publish` environment so the OIDC tokens minted in
@@ -288,28 +176,17 @@ jobs:
       - name: Update npm
         run: npm install -g npm@latest
 
-      # macOS native binary: download the freshly-notarized artifact (cache miss),
-      # or restore the previously-notarized bundle from cache (cache hit, already
-      # re-verified by verify-native-macos).
+      # Native binaries built, signed, and notarized earlier in this run
       - name: Download macOS native binary (built this run)
-        if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true' && needs.plan.outputs.macos-cache-hit != 'true'
+        if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: native-bin-macos-npm
           path: packages/varlock/native-bins/darwin/VarlockEnclave.app
-      - name: Restore macOS native binary (from cache)
-        if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true' && needs.plan.outputs.macos-cache-hit == 'true'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: packages/varlock/native-bins/darwin/VarlockEnclave.app
-          key: ${{ needs.plan.outputs.macos-cache-key }}
-          fail-on-cache-miss: true
       - name: Restore native binary execute permission
         if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
         run: chmod +x packages/varlock/native-bins/darwin/VarlockEnclave.app/Contents/MacOS/varlock-local-encrypt
 
-      # Rust native binaries: always built in this run, never restored from cache
-      # (see build-native-rust above)
       - name: Download Rust native binaries (built this run)
         if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -446,11 +323,10 @@ jobs:
   release-binaries:
     name: Release varlock CLI binaries
     needs: [plan, release, build-cli-macos]
-    # `release` always has a by-design skipped dependency (the native-binary cache
-    # logic skips either verify-native-macos on a miss, or build/notarize on a hit),
-    # and GitHub propagates that skip through `release`'s always() into the implicit
-    # success() of any downstream job — which would skip this job on every release.
-    # Mirror the `release` job's guard to break that propagation.
+    # `release` can have skipped dependencies (the native-binary jobs, on a publish
+    # without varlock), and GitHub propagates a skip through `release`'s always()
+    # into the implicit success() of downstream jobs. Mirror the `release` job's
+    # guard so this job never depends on that propagation.
     if: always() && !failure() && !cancelled() && needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
     runs-on: ubuntu-latest
     permissions:

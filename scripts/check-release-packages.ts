@@ -8,15 +8,22 @@
  * Usage:
  *   bun run scripts/check-release-packages.ts
  *
+ * Native helper packages (@varlock/native-helper-*) are dropped from the preview
+ * when their native sources are unchanged since the last release (see
+ * native-sources.ts): the preview's varlock then depends on the published
+ * helpers, which hold exactly those binaries, signed and notarized.
+ *
  * Outputs (via GITHUB_OUTPUT if available):
  *   packages=["path1","path2"]
- *   includes-varlock=true|false
+ *   needs-macos-native=true|false  (preview includes the darwin helper)
+ *   needs-rust-native=true|false   (preview includes a linux/win32 helper)
  */
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { listWorkspaces } from './list-workspaces';
+import { NATIVE_HELPER_PACKAGES, nativeSourcesChanged, type NativeSide } from './native-sources';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -120,8 +127,6 @@ if (bumpyStatusRaw) {
 // filter out vscode extension which is not released via npm
 releasePackagePaths = releasePackagePaths.filter((p: string) => !p.endsWith('packages/vscode-plugin'));
 
-// The platform binary packages also need the native binaries staged in CI,
-// so releasing any of them counts as "includes varlock" for workflow gating.
 // Match on package names (not directory paths) so relocating packages cannot
 // silently change release gating.
 function readPackageName(pkgPath: string): string | undefined {
@@ -131,17 +136,27 @@ function readPackageName(pkgPath: string): string | undefined {
     return undefined;
   }
 }
-const releaseNames = releasePackagePaths.map(readPackageName);
-const includesVarlock = releaseNames.some(
-  (name) => name === 'varlock' || name?.startsWith('@varlock/native-helper-'),
-);
+
+const needsNative: Record<NativeSide, boolean> = { macos: false, rust: false };
+for (const side of Object.keys(NATIVE_HELPER_PACKAGES) as Array<NativeSide>) {
+  const helperNames = NATIVE_HELPER_PACKAGES[side];
+  const hasHelpers = releasePackagePaths.some((p) => helperNames.includes(readPackageName(p) ?? ''));
+  if (!hasHelpers) continue;
+  if (nativeSourcesChanged(side)) {
+    needsNative[side] = true;
+  } else {
+    console.log(`Native ${side} sources unchanged since last release, previews use the published ${helperNames.join(', ')}`);
+    releasePackagePaths = releasePackagePaths.filter((p) => !helperNames.includes(readPackageName(p) ?? ''));
+  }
+}
 
 console.log('Packages to release:', releasePackagePaths);
-console.log('Includes varlock:', includesVarlock);
+console.log('Needs native builds:', needsNative);
 
 // Write to GITHUB_OUTPUT if running in CI
 const githubOutput = process.env.GITHUB_OUTPUT;
 if (githubOutput) {
   fs.appendFileSync(githubOutput, `packages=${JSON.stringify(releasePackagePaths)}\n`);
-  fs.appendFileSync(githubOutput, `includes-varlock=${includesVarlock}\n`);
+  fs.appendFileSync(githubOutput, `needs-macos-native=${needsNative.macos}\n`);
+  fs.appendFileSync(githubOutput, `needs-rust-native=${needsNative.rust}\n`);
 }
