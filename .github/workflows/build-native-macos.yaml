@@ -209,15 +209,6 @@ jobs:
           path: packages/varlock/native-bins/darwin/VarlockEnclave.app
           retention-days: 7
 
-      # Cache the signed .app so other jobs (e.g. release-preview) can restore
-      # it on a Linux runner without needing a macOS build
-      - name: Cache signed .app bundle
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        continue-on-error: true  # cache key is immutable; fails harmlessly if already saved by a concurrent run
-        with:
-          path: packages/varlock/native-bins/darwin/VarlockEnclave.app
-          key: native-bin-macos-signed-${{ hashFiles('packages/encryption-binary-swift/swift/Package.swift', 'packages/encryption-binary-swift/swift/Sources/**') }}
-
       - name: Cleanup signing keychain
         if: always()
         run: |

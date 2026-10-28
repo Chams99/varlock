@@ -1,0 +1,41 @@
+name: Native binary cache keys
+description: >
+  Compute the content-addressed cache keys for the native helper binaries.
+  Shared by release.yaml (which saves the signed/notarized binaries on main)
+  and test.yaml (which restores them for PR previews), so the keys cannot drift.
+  Run on an ubuntu GitHub-hosted runner: hashFiles can differ across OSes.
+
+outputs:
+  macos-cache-key:
+    description: Cache key of the notarized macOS VarlockEnclave.app bundle
+    value: ${{ steps.keys.outputs.macos-cache-key }}
+  rust-source-hash:
+    description: >
+      Rust source hash; the per-platform cache key is
+      native-bin-rust-<subdir>-<rust-source-hash> (see build-native-rust.yaml)
+    value: ${{ steps.keys.outputs.rust-source-hash }}
+
+runs:
+  using: composite
+  steps:
+    # The hashes cover the native source, the build/bundle scripts, AND the
+    # workflows that drive them: anything that can change the produced binary.
+    # The leading `v1` salt forces a full rebuild when something hashFiles can't
+    # see changes (runner image / Xcode / Rust toolchain). Bump it to invalidate.
+    #
+    # Note: the macOS .app bundle embeds a fixed constant version (hardcoded in
+    # build-swift.ts, not the npm version), so the notarized bundle is
+    # byte-stable across releases, which is what makes cross-release reuse
+    # valid. Do not reintroduce a per-release version there.
+    - id: keys
+      shell: bash
+      env:
+        MACOS_HASH: ${{ hashFiles('packages/encryption-binary-swift/swift/**', 'packages/encryption-binary-swift/scripts/**', 'packages/encryption-binary-swift/package.json', '.github/workflows/build-native-macos.yaml', '.github/workflows/notarize-native-macos.yaml') }}
+        RUST_HASH: ${{ hashFiles('packages/encryption-binary-rust/Cargo.lock', 'packages/encryption-binary-rust/Cargo.toml', 'packages/encryption-binary-rust/src/**', 'packages/encryption-binary-rust/scripts/**', '.github/workflows/build-native-rust.yaml') }}
+      run: |
+        if [ -z "$MACOS_HASH" ] || [ -z "$RUST_HASH" ]; then
+          echo "::error::native source files not found (is the repo checked out?)"
+          exit 1
+        fi
+        echo "macos-cache-key=native-bin-macos-notarized-v1-$MACOS_HASH" >> "$GITHUB_OUTPUT"
+        echo "rust-source-hash=v1-$RUST_HASH" >> "$GITHUB_OUTPUT"
