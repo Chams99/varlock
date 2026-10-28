@@ -272,9 +272,13 @@ jobs:
           mkdir -p "packages/varlock/native-bins/${{ matrix.native-bin-subdir }}"
           cp "native-bins/${{ matrix.native-bin-subdir }}/${{ matrix.binary-name }}" \
              "packages/varlock/native-bins/${{ matrix.native-bin-subdir }}/"
+      # enableCrossOsArchive: the win32 binary is saved on Windows but probed and
+      # restored on Ubuntu; without it, the cache version gets a Windows-only
+      # component and Ubuntu lookups never match.
       - name: Cache built binary
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         continue-on-error: true  # cache key is immutable; fails harmlessly if already saved by a concurrent run
         with:
           path: packages/varlock/native-bins/${{ matrix.native-bin-subdir }}/
+          enableCrossOsArchive: true
           key: native-bin-rust-${{ matrix.native-bin-subdir }}-${{ inputs.source-hash || hashFiles('packages/encryption-binary-rust/Cargo.lock', 'packages/encryption-binary-rust/src/**') }}

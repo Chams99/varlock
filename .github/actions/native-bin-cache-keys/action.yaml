@@ -30,7 +30,7 @@ runs:
     - id: keys
       shell: bash
       env:
-        MACOS_HASH: ${{ hashFiles('packages/encryption-binary-swift/swift/**', 'packages/encryption-binary-swift/scripts/**', 'packages/encryption-binary-swift/package.json', '.github/workflows/build-native-macos.yaml', '.github/workflows/notarize-native-macos.yaml') }}
+        MACOS_HASH: ${{ hashFiles('packages/encryption-binary-swift/swift/**', 'packages/encryption-binary-swift/scripts/**', 'packages/encryption-binary-swift/package.json', 'packages/encryption-binary-swift/VarlockEnclave.entitlements', 'packages/encryption-binary-swift/resources/**', '.github/workflows/build-native-macos.yaml', '.github/workflows/notarize-native-macos.yaml') }}
         RUST_HASH: ${{ hashFiles('packages/encryption-binary-rust/Cargo.lock', 'packages/encryption-binary-rust/Cargo.toml', 'packages/encryption-binary-rust/src/**', 'packages/encryption-binary-rust/scripts/**', '.github/workflows/build-native-rust.yaml') }}
       run: |
         if [ -z "$MACOS_HASH" ] || [ -z "$RUST_HASH" ]; then
