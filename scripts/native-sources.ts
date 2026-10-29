@@ -1,29 +1,38 @@
 /**
- * Native helper binary inputs, shared by PR preview gating and preview caching.
+ * Native helper binary inputs, shared by PR preview gating, preview caching, and
+ * the native bump check.
  *
- * - `changed`: whether the native sources differ from the last varlock release
- *   tag (`varlock@<packages/varlock/package.json version>`). When they don't, the
- *   published @varlock/native-helper-* packages already contain exactly these
- *   binaries, so previews depend on those instead of building their own. The
- *   build workflows are not part of this check: CI plumbing changes (action pins
- *   and the like) would otherwise force preview builds until the next release.
+ * The @varlock/native-helper-* packages are versioned independently of varlock
+ * and only released when their binaries change. varlock pins them as exact
+ * versions, so a varlock version always maps to one set of released binaries,
+ * and a helper with no pending release is exactly what is on npm at its
+ * package.json version.
+ *
+ * - `pending`: the side's helpers have a pending release (a bump file on this
+ *   branch or on main). Previews of such a branch need preview builds of that
+ *   side; everything else uses the published helpers.
  * - `touched`: whether this branch changes the sources or the build workflows
- *   relative to its merge base with origin/main. CI then test-builds that side
- *   even if the preview uses the published helpers, so a broken build is caught
- *   in its own PR instead of at release time.
+ *   relative to its merge base with origin/main. CI then test-builds that side,
+ *   so a broken build is caught in its own PR instead of at release time.
  * - `key`: content hash of the sources and build workflows (git blob ids, so
  *   identical on every OS), used as the cache key for unsigned preview builds.
  *
- * Releases never use any of this: they always build natives from source.
+ * Bump check: when this branch changes a side's sources, some bump file must
+ * name one of that side's helpers (bump type `none` if the binary is
+ * unaffected), otherwise the script fails. bumpy cannot enforce this itself: it
+ * only maps changes inside a package's own directory, and the Swift / Rust
+ * sources live in separate private packages.
+ *
+ * Releases never use the preview builds: they always build natives from source.
  *
  * Usage:
  *   bun run scripts/native-sources.ts
  *
  * Outputs (via GITHUB_OUTPUT if available), for each of `macos` and `rust`:
- *   <side>-changed=true|false  <side>-touched=true|false
+ *   <side>-pending=true|false  <side>-touched=true|false
  *   <side>-key=native-preview-<side>-v1-<sha256>
  */
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, execSync, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -68,23 +77,19 @@ function buildInputs(side: NativeSide) {
   return [...NATIVE_SOURCES[side], ...BUILD_WORKFLOWS[side]];
 }
 
-/** npm package names of the helpers each side produces */
-export const NATIVE_HELPER_PACKAGES: Record<NativeSide, Array<string>> = {
-  macos: ['@varlock/native-helper-darwin'],
-  rust: [
-    '@varlock/native-helper-linux-x64',
-    '@varlock/native-helper-linux-arm64',
-    '@varlock/native-helper-win32-x64',
-  ],
+/** npm package suffixes (packages/native-helpers/<suffix>) of the helpers each side produces */
+export const NATIVE_HELPER_SUFFIXES: Record<NativeSide, Array<string>> = {
+  macos: ['darwin'],
+  rust: ['linux-x64', 'linux-arm64', 'win32-x64'],
 };
+
+/** npm package names of the helpers each side produces */
+export const NATIVE_HELPER_PACKAGES = Object.fromEntries(
+  Object.entries(NATIVE_HELPER_SUFFIXES).map(([side, suffixes]) => [side, suffixes.map((s) => `@varlock/native-helper-${s}`)]),
+) as Record<NativeSide, Array<string>>;
 
 function git(args: Array<string>) {
   return execFileSync('git', args, { cwd: MONOREPO_ROOT, encoding: 'utf-8' });
-}
-
-export function lastReleaseTag() {
-  const pkgJson = JSON.parse(fs.readFileSync(path.join(MONOREPO_ROOT, 'packages/varlock/package.json'), 'utf-8'));
-  return `varlock@${pkgJson.version}`;
 }
 
 export function nativeSourceKey(side: NativeSide) {
@@ -104,32 +109,63 @@ function differs(fromRef: string, paths: Array<string>) {
   return diff.status === 1;
 }
 
-/** True when the sources differ from the last release tag, or the tag is not available */
-export function nativeSourcesChanged(side: NativeSide) {
-  const tagRef = `refs/tags/${lastReleaseTag()}`;
-  if (!refExists(tagRef)) {
-    console.log(`release tag ${lastReleaseTag()} not found, treating native ${side} sources as changed`);
-    return true;
-  }
-  return differs(tagRef, [...NATIVE_SOURCES[side]]);
+function mergeBase() {
+  if (!refExists('refs/remotes/origin/main')) return undefined;
+  return git(['merge-base', 'refs/remotes/origin/main', 'HEAD']).trim();
 }
 
-/** True when this branch changes the sources or build workflows vs its merge base with origin/main */
-export function nativeBuildTouched(side: NativeSide) {
-  if (!refExists('refs/remotes/origin/main')) return false;
-  const mergeBase = git(['merge-base', 'refs/remotes/origin/main', 'HEAD']).trim();
-  return differs(mergeBase, buildInputs(side));
+/** `bumpy status --json`, which may exit non-zero with warnings but still print valid JSON */
+export function readBumpyStatus(): { bumpFiles: Array<any>, releases: Array<any> } {
+  let raw: string;
+  try {
+    raw = execSync('bunx @varlock/bumpy status --json 2>/dev/null', { cwd: MONOREPO_ROOT }).toString();
+  } catch (execErr: any) {
+    raw = execErr.stdout?.toString() ?? '';
+  }
+  // stdout may contain warning lines before the JSON, extract just the JSON
+  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+  return jsonMatch ? JSON.parse(jsonMatch[0]) : { bumpFiles: [], releases: [] };
+}
+
+function helperVersion(suffix: string, ref?: string) {
+  const relPath = `packages/native-helpers/${suffix}/package.json`;
+  const raw = ref ? git(['show', `${ref}:${relPath}`]) : fs.readFileSync(path.join(MONOREPO_ROOT, relPath), 'utf-8');
+  return JSON.parse(raw).version as string;
 }
 
 // run as a script (not when imported by check-release-packages.ts)
 if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  const status = readBumpyStatus();
+  const base = mergeBase();
   const lines: Array<string> = [];
+  const missingBumps: Array<NativeSide> = [];
   for (const side of Object.keys(NATIVE_SOURCES) as Array<NativeSide>) {
-    const changed = nativeSourcesChanged(side);
-    const touched = nativeBuildTouched(side);
+    const helpers = NATIVE_HELPER_PACKAGES[side];
+    const pending = status.releases.some((r) => helpers.includes(r.name));
+    const touched = base ? differs(base, buildInputs(side)) : false;
     const key = nativeSourceKey(side);
-    console.log(`native ${side}: changed since ${lastReleaseTag()}=${changed} touched by branch=${touched} key=${key}`);
-    lines.push(`${side}-changed=${changed}`, `${side}-touched=${touched}`, `${side}-key=${key}`);
+    console.log(`native ${side}: pending release=${pending} touched by branch=${touched} key=${key}`);
+    lines.push(`${side}-pending=${pending}`, `${side}-touched=${touched}`, `${side}-key=${key}`);
+
+    if (base && differs(base, [...NATIVE_SOURCES[side]])) {
+      const covered = status.bumpFiles.some((bf) => bf.releases.some((r: any) => helpers.includes(r.name)));
+      // the version PR consumes the bump files and bumps the helper versions itself
+      const versioning = NATIVE_HELPER_SUFFIXES[side].some((s) => helperVersion(s) !== helperVersion(s, base));
+      if (!covered && !versioning) missingBumps.push(side);
+    }
   }
   if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, `${lines.join('\n')}\n`);
+
+  if (missingBumps.length) {
+    for (const side of missingBumps) {
+      const pkg = NATIVE_HELPER_PACKAGES[side][0];
+      console.error([
+        `Native ${side} sources changed on this branch, but no bump file names ${NATIVE_HELPER_PACKAGES[side].join(' / ')}.`,
+        'The helpers are only released when bumped, so without one this change never ships. Add a bump file:',
+        `  bunx @varlock/bumpy add --packages "${pkg}:patch" --message "<what changed>" --name "${side}-native-<change>"`,
+        `Use "${pkg}:none" instead if the change does not affect the shipped binary.`,
+      ].join('\n'));
+    }
+    process.exit(1);
+  }
 }

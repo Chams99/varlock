@@ -38,8 +38,9 @@ jobs:
           echo "::error::Timed out waiting for CI test suite"
           exit 1
 
-  # Determine what bumpy will do. Native binaries are only built when publishing
-  # varlock, and always from source in that same run (see build-native-macos).
+  # Determine what bumpy will do. Native helpers are versioned independently of
+  # varlock and only built when this publish releases them, always from source in
+  # this same run (see build-native-macos).
   plan:
     needs: wait-for-tests
     runs-on: ubuntu-latest
@@ -47,6 +48,9 @@ jobs:
       mode: ${{ steps.plan.outputs.mode }}
       bumpy-version: ${{ steps.bumpy-version.outputs.version }}
       includes-varlock: ${{ contains(fromJSON(steps.plan.outputs.json).packageNames, 'varlock') }}
+      includes-macos-native: ${{ contains(fromJSON(steps.plan.outputs.json).packageNames, '@varlock/native-helper-darwin') }}
+      # the three Rust helpers are a bumpy fixed group, so one stands for all
+      includes-rust-native: ${{ contains(fromJSON(steps.plan.outputs.json).packageNames, '@varlock/native-helper-linux-x64') }}
       includes-vscode: ${{ contains(fromJSON(steps.plan.outputs.json).packageNames, 'env-spec-language') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -91,14 +95,14 @@ jobs:
           BUMPY_GH_TOKEN: ${{ secrets.BUMPY_GH_TOKEN }}
           GH_TOKEN: ${{ github.token }}
 
-  # Native binaries for a varlock publish are always built, signed, and (macOS)
+  # Native helpers being released are always built, signed, and (macOS)
   # notarized from source in this run. Nothing a release ships comes from the
   # Actions cache: the keys are predictable and any job in main's cache scope
   # (schedule, workflow_run, a compromised dependency in a push run) can write
   # them, so neither binary caches nor build caches (Cargo, Swift .build) are used.
   build-native-macos:
     needs: plan
-    if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
+    if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-macos-native == 'true'
     uses: ./.github/workflows/build-native-macos.yaml
     with:
       mode: release
@@ -111,7 +115,7 @@ jobs:
   # Notarize for production npm distribution
   notarize-native-macos:
     needs: [plan, build-native-macos]
-    if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
+    if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-macos-native == 'true'
     uses: ./.github/workflows/notarize-native-macos.yaml
     with:
       source-artifact-name: native-bin-macos-signed
@@ -125,7 +129,7 @@ jobs:
     permissions:
       contents: read
       id-token: write # Azure OIDC signing in the reusable workflow
-    if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
+    if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-rust-native == 'true'
     uses: ./.github/workflows/build-native-rust.yaml
     with:
       artifact-name: native-bin-rust
@@ -135,7 +139,7 @@ jobs:
       OP_CI_TOKEN: ${{ secrets.OP_CI_TOKEN }}
 
   # Publish path: native binaries are ready (built this run, or skipped when the
-  # publish does not include varlock), so build the npm packages and publish. Gated on `mode == 'publish'`;
+  # publish releases no helpers), so build the npm packages and publish. Gated on `mode == 'publish'`;
   # the version-PR path is handled by the `version-pr` job above.
   release:
     name: Release
@@ -176,40 +180,44 @@ jobs:
       - name: Update npm
         run: npm install -g npm@latest
 
-      # Native binaries built, signed, and notarized earlier in this run
+      # Native helpers: binaries built, signed, and notarized earlier in this run
+      # for helpers this publish releases; the published version pinned by varlock
+      # for the rest (needed for SHA256SUMS and the CLI binaries below).
       - name: Download macOS native binary (built this run)
-        if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
+        if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-macos-native == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: native-bin-macos-npm
           path: packages/varlock/native-bins/darwin/VarlockEnclave.app
       - name: Restore native binary execute permission
-        if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
+        if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-macos-native == 'true'
         run: chmod +x packages/varlock/native-bins/darwin/VarlockEnclave.app/Contents/MacOS/varlock-local-encrypt
 
       - name: Download Rust native binaries (built this run)
-        if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
+        if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-rust-native == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: native-bin-rust-linux-x64
-          path: packages/varlock/native-bins/linux-x64
-      - name: Download Rust native binaries - linux-arm64 (built this run)
-        if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: native-bin-rust-linux-arm64
-          path: packages/varlock/native-bins/linux-arm64
-      - name: Download Rust native binaries - win32-x64 (built this run)
-        if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: native-bin-rust-win32-x64
-          path: packages/varlock/native-bins/win32-x64
-      - name: Restore Rust binary execute permissions
-        if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
+          pattern: native-bin-rust-*
+          path: packages/varlock/native-bins
+      - name: Stage Rust native binaries
+        if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-rust-native == 'true'
+        working-directory: packages/varlock/native-bins
         run: |
-          chmod +x packages/varlock/native-bins/linux-x64/varlock-local-encrypt
-          chmod +x packages/varlock/native-bins/linux-arm64/varlock-local-encrypt
+          for SUBDIR in linux-x64 linux-arm64 win32-x64; do
+            rm -rf "$SUBDIR" && mv "native-bin-rust-$SUBDIR" "$SUBDIR"
+          done
+          chmod +x linux-x64/varlock-local-encrypt linux-arm64/varlock-local-encrypt
+
+      - name: Fetch published native helpers (not released this run)
+        if: needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
+        env:
+          MACOS: ${{ needs.plan.outputs.includes-macos-native }}
+          RUST: ${{ needs.plan.outputs.includes-rust-native }}
+        run: |
+          PLATFORMS=""
+          if [ "$MACOS" != "true" ]; then PLATFORMS="darwin"; fi
+          if [ "$RUST" != "true" ]; then PLATFORMS="$PLATFORMS,linux-x64,linux-arm64,win32-x64"; fi
+          if [ -n "${PLATFORMS#,}" ]; then bun run scripts/fetch-native-helpers.ts --platforms "${PLATFORMS#,}"; fi
 
       # Fail loudly if any native binary is missing before we build the npm package,
       # rather than silently publishing an incomplete package.
@@ -306,8 +314,8 @@ jobs:
   # --- varlock CLI binary distribution ---------------------------------------
   # The macOS CLI archives are built, Developer ID signed, and notarized on a
   # macOS runner; release-binaries builds every other target on linux and merges
-  # them in. Both reuse the signed/notarized native binaries from earlier in THIS
-  # run. Same skip-propagation guard as release-binaries below.
+  # them in. Both reuse the native binaries staged by the release job. Same
+  # skip-propagation guard as release-binaries below.
   build-cli-macos:
     needs: [plan, release]
     if: always() && !failure() && !cancelled() && needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
@@ -323,8 +331,8 @@ jobs:
   release-binaries:
     name: Release varlock CLI binaries
     needs: [plan, release, build-cli-macos]
-    # `release` can have skipped dependencies (the native-binary jobs, on a publish
-    # without varlock), and GitHub propagates a skip through `release`'s always()
+    # `release` can have skipped dependencies (the native-binary jobs, on a publish that
+    # releases no helpers), and GitHub propagates a skip through `release`'s always()
     # into the implicit success() of downstream jobs. Mirror the `release` job's
     # guard so this job never depends on that propagation.
     if: always() && !failure() && !cancelled() && needs.plan.outputs.mode == 'publish' && needs.plan.outputs.includes-varlock == 'true'
@@ -358,7 +366,7 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "tag=varlock@$V" >> "$GITHUB_OUTPUT"
 
-      # Reuse the native binaries built + signed + notarized earlier this run
+      # Reuse the native binaries staged by the release job
       - name: Download staged native binaries
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:

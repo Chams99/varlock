@@ -17,12 +17,12 @@ jobs:
     outputs:
       release-packages: ${{ steps.check-release.outputs.packages }}
       # Which unsigned preview natives this run needs. On PRs: the preview includes
-      # that side's @varlock/native-helper-* packages (they are dropped when native
-      # sources are unchanged since the last release; see check-release-packages.ts).
-      # On main: native sources changed since the last release, so build them once
-      # to warm the main-scoped cache that PR previews restore.
-      needs-macos-native: ${{ steps.check-release.outputs.needs-macos-native || steps.native.outputs.macos-changed }}
-      needs-rust-native: ${{ steps.check-release.outputs.needs-rust-native || steps.native.outputs.rust-changed }}
+      # that side's @varlock/native-helper-* packages, which only happens when they
+      # have a pending release (see check-release-packages.ts). On main: a helper
+      # release is pending, so build them once to warm the main-scoped cache that
+      # PR previews restore.
+      needs-macos-native: ${{ steps.check-release.outputs.needs-macos-native || steps.native.outputs.macos-pending }}
+      needs-rust-native: ${{ steps.check-release.outputs.needs-rust-native || steps.native.outputs.rust-pending }}
       # PR changes that side's sources or build workflow: test-build it even when
       # the preview uses the published helpers
       macos-native-touched: ${{ steps.native.outputs.macos-touched }}
@@ -42,6 +42,11 @@ jobs:
           node-version: "24.x"
       - name: Install js deps (w/ bun)
         run: bun install
+      # Also fails when this branch changes native sources without a helper bump
+      # file (see scripts/native-sources.ts)
+      - name: Native helper sources
+        id: native
+        run: bun run scripts/native-sources.ts
       - name: Audit dependencies
         run: bun run audit:changed
       - name: Enable turborepo remote cache
@@ -80,9 +85,6 @@ jobs:
         if: github.ref_name != 'main'
         id: check-release
         run: bun run scripts/check-release-packages.ts
-      - name: Native helper sources
-        id: native
-        run: bun run scripts/native-sources.ts
 
   # Unsigned preview native binaries. Releases never use these (release.yaml always
   # builds natives from source), so they need no signing secrets: macOS is ad-hoc
@@ -179,7 +181,7 @@ jobs:
   # Publish preview packages via pkg-pr-new
   release-preview-packages:
     needs: [build-and-test, native-cache-check, build-native-macos, build-native-rust]
-    # Run even if native builds were skipped (source unchanged), but not if anything failed or was cancelled.
+    # Run even if native builds were skipped (no helper release pending, or cached), but not if anything failed or was cancelled.
     # `!cancelled()` only covers whole-workflow cancellation, so build-and-test must explicitly be a success
     # (a cancelled job leaves its outputs empty). Skip on main, and when there is nothing to release.
     if: >-

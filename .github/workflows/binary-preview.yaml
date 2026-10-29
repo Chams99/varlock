@@ -24,30 +24,27 @@ jobs:
       (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'preview:standalone'))
     runs-on: depot-ubuntu-24.04
     outputs:
-      macos-changed: ${{ steps.native.outputs.macos-changed }}
-      rust-changed: ${{ steps.native.outputs.rust-changed }}
+      macos-pending: ${{ steps.native.outputs.macos-pending }}
+      rust-pending: ${{ steps.native.outputs.rust-pending }}
       macos-key: ${{ steps.native.outputs.macos-key }}
       rust-key: ${{ steps.native.outputs.rust-key }}
-      varlock-version: ${{ steps.native.outputs.varlock-version }}
     steps:
       - run: echo "preview:standalone label detected, building preview binaries"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0 # native-sources.ts diffs against the last release tag
+          fetch-depth: 0 # native-sources.ts diffs against the merge base with main
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - name: Native helper sources
         id: native
-        run: |
-          bun run scripts/native-sources.ts
-          echo "varlock-version=$(jq -r .version packages/varlock/package.json)" >> "$GITHUB_OUTPUT"
+        run: bun run scripts/native-sources.ts
 
-  # Native helpers: when a side's sources are unchanged since the last release,
-  # the published @varlock/native-helper-* binaries are used as-is (see
+  # Native helpers: when a side's helpers have no pending release, the published
+  # @varlock/native-helper-* binaries at their pinned version are used as-is (see
   # build-sea-binaries). Otherwise build unsigned preview binaries; no secrets.
   build-native-macos:
     needs: check-label
-    if: needs.check-label.outputs.macos-changed == 'true'
+    if: needs.check-label.outputs.macos-pending == 'true'
     uses: ./.github/workflows/build-native-macos.yaml
     with:
       mode: preview
@@ -56,7 +53,7 @@ jobs:
 
   build-native-rust:
     needs: check-label
-    if: needs.check-label.outputs.rust-changed == 'true'
+    if: needs.check-label.outputs.rust-pending == 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/build-native-rust.yaml
@@ -86,36 +83,20 @@ jobs:
         with:
           token: ${{ secrets.DEPOT_TURBO_TOKEN }}
 
-      # Published helpers for sides whose native sources are unchanged
+      # Published helpers for sides with no pending helper release
       - name: Fetch published native helpers from npm
         env:
-          VARLOCK_VERSION: ${{ needs.check-label.outputs.varlock-version }}
-          MACOS_CHANGED: ${{ needs.check-label.outputs.macos-changed }}
-          RUST_CHANGED: ${{ needs.check-label.outputs.rust-changed }}
+          MACOS: ${{ needs.check-label.outputs.macos-pending }}
+          RUST: ${{ needs.check-label.outputs.rust-pending }}
         run: |
-          set -euo pipefail
-          DEST="$GITHUB_WORKSPACE/packages/varlock/native-bins"
-          TMP="$RUNNER_TEMP/varlock-npm"
-          mkdir -p "$TMP" && cd "$TMP"
-          # platform suffix -> tarball entry; source of truth is
-          # packages/native-helpers/platforms.ts - keep in sync
-          fetch() { # <platform suffix> <tarball entry>
-            rm -rf package
-            npm pack "@varlock/native-helper-$1@${VARLOCK_VERSION}"
-            tar -xzf "varlock-native-helper-$1-${VARLOCK_VERSION}.tgz"
-            rm -rf "${DEST:?}/$1" && mkdir -p "$DEST/$1"
-            cp -R "package/$2" "$DEST/$1/$2"
-          }
-          if [ "$MACOS_CHANGED" != "true" ]; then fetch darwin VarlockEnclave.app; fi
-          if [ "$RUST_CHANGED" != "true" ]; then
-            fetch linux-x64 varlock-local-encrypt
-            fetch linux-arm64 varlock-local-encrypt
-            fetch win32-x64 varlock-local-encrypt.exe
-          fi
+          PLATFORMS=""
+          if [ "$MACOS" != "true" ]; then PLATFORMS="darwin"; fi
+          if [ "$RUST" != "true" ]; then PLATFORMS="$PLATFORMS,linux-x64,linux-arm64,win32-x64"; fi
+          if [ -n "${PLATFORMS#,}" ]; then bun run scripts/fetch-native-helpers.ts --platforms "${PLATFORMS#,}"; fi
 
-      # Preview builds from this run for sides whose sources changed
+      # Preview builds from this run for sides with a pending helper release
       - name: Download macOS native binary
-        if: needs.check-label.outputs.macos-changed == 'true'
+        if: needs.check-label.outputs.macos-pending == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: native-bin-macos-preview
@@ -124,19 +105,19 @@ jobs:
         run: chmod +x packages/varlock/native-bins/darwin/VarlockEnclave.app/Contents/MacOS/varlock-local-encrypt
 
       - name: Download Linux x64 native binary
-        if: needs.check-label.outputs.rust-changed == 'true'
+        if: needs.check-label.outputs.rust-pending == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: native-bin-rust-preview-linux-x64
           path: packages/varlock/native-bins/linux-x64
       - name: Download Linux arm64 native binary
-        if: needs.check-label.outputs.rust-changed == 'true'
+        if: needs.check-label.outputs.rust-pending == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: native-bin-rust-preview-linux-arm64
           path: packages/varlock/native-bins/linux-arm64
       - name: Download Windows x64 native binary
-        if: needs.check-label.outputs.rust-changed == 'true'
+        if: needs.check-label.outputs.rust-pending == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: native-bin-rust-preview-win32-x64
